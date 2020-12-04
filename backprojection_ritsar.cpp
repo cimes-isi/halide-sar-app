@@ -9,6 +9,12 @@
 using namespace Halide;
 using namespace Halide::Tools;
 
+#ifndef BP_RITSAR_USE_INTERP_BSEARCH_LUT
+// If set, use local interp implementation with extern binary search function,
+// otherwise use an interp function that is completely extern
+#define BP_RITSAR_USE_INTERP_BSEARCH_LUT 0
+#endif 
+
 class BackprojectionRitsarGenerator : public Halide::Generator<BackprojectionRitsarGenerator> {
 public:
     enum class Schedule { Serial,
@@ -87,22 +93,27 @@ public:
     Output<Buffer<double>> output_img{"output_img", 3};
 
     // xs: {nu*nv, npulses}
-    // lsa, lsb, lsn: implicit linspace parameters (min, max, count)
+    // xp: {N_fft}
     // fp: {N_fft, npulses}
     // output: {nu*nv, npulses}
-    inline Expr interp(Func xs, Expr lsa, Expr lsb, Expr lsn, ComplexFunc fp, Expr c, Var x, Var y) {
-        Expr lsr = (lsb-lsa) / (lsn-1);             // linspace rate of increase
-        Expr luts = (xs(x, y) - lsa) / lsr;         // input value scaled to linspace
-        Expr lutl = ConciseCasts::i32(floor(luts)); // lower index
-        Expr lutu = lutl + 1;                       // upper index
-        Expr luto = luts - lutl;                    // offset within lower-upper span
-
-        // clamps to ensure fp accesses occur within the expected range, even if the input is crazy
-        Expr cll = clamp(lutl, 0, lsn - 1);
-        Expr clu = clamp(lutu, 0, lsn - 1);
-        Expr pos = clamp(luto, Expr(0.0), Expr(1.0));
-
-        return lerp(fp.inner(c, cll, y), fp.inner(c, clu, y), pos);
+    inline Expr interp(Func xs, Func xp, ComplexFunc fp, Expr extent, Expr c, Var x, Var y) {
+        // index lookups into xp
+        Func bsearch_lut("bsearch_lut");
+        bsearch_lut.define_extern("bsearch_lut_extern", {xs, xp, extent}, Int(32), {x, y});
+        bsearch_lut.compute_root();
+        // upper index: first index in xp where xp(r) >= xs(x, y): shape = {extent}
+        Expr lutu = bsearch_lut(x, y);
+        // Halide complains if we don't clamp
+        Expr clu = clamp(lutu, 0, extent - 1);
+        // lower index: last index in xp where xp(r) < xs(x, y): shape = {extent}
+        Expr lutl = select(xp(clu) <= xs(x, y), clu, clu - 1);
+        Expr cll = clamp(lutl, 0, extent - 1);
+        // Note: not enforcing that xs values are in xp's value range
+        return select(cll == clu,
+                      ConciseCasts::f64(fp.inner(c, cll, y)),
+                      lerp(ConciseCasts::f64(fp.inner(c, cll, y)),
+                           ConciseCasts::f64(fp.inner(c, clu, y)),
+                           ConciseCasts::f64((xs(x, y) - xp(cll)) / (xp(clu) - xp(cll)))));
     }
 
     void generate() {
@@ -163,6 +174,9 @@ public:
         out_Q(c, x, y) = Q.inner(c, x, y);
 #endif
 
+        // dr: produces shape {N_fft}
+        dr(x) = linspace(floor(-nsamples * delta_r / 2), floor(nsamples * delta_r / 2), N_fft, x);
+
         // norm(r0): produces shape {npulses}
         norm_r0(x) = norm(pos(rnd, x));
 #if DEBUG_NORM_R0
@@ -188,16 +202,24 @@ public:
 #endif
 
         // Q_{real,imag,hat}: produce shape {nu*nv, npulses}
-        Q_real(x, y) = interp(dr_i, floor(-nsamples * delta_r / 2), floor(nsamples * delta_r / 2), N_fft, Q, 0, x, y);
+#if BP_RITSAR_USE_INTERP_BSEARCH_LUT
+        Q_real(x, y) = interp(dr_i, dr, Q, N_fft, 0, x, y);
+#else
+        Q_r(x, y) = Q.inner(0, x, y);
+        Q_real.define_extern("interp_extern", {dr_i, dr, Q_r, N_fft}, Float(64), {x, y});
+#endif
 #if DEBUG_Q_REAL
         out_q_real(x, y) = Q_real(x, y);
 #endif
-        Q_imag(x, y) = interp(dr_i, floor(-nsamples * delta_r / 2), floor(nsamples * delta_r / 2), N_fft, Q, 1, x, y);
+#if BP_RITSAR_USE_INTERP_BSEARCH_LUT
+        Q_imag(x, y) = interp(dr_i, dr, Q, N_fft, 1, x, y);
+#else
+        Q_i(x, y) = Q.inner(1, x, y);
+        Q_imag.define_extern("interp_extern", {dr_i, dr, Q_i, N_fft}, Float(64), {x, y});
+#endif
 #if DEBUG_Q_IMAG
         out_q_imag(x, y) = Q_imag(x, y);
 #endif
-        // NOTE: it is possible to do this, directly
-        //Q_hat(x, y) = interp(dr_i, floor(-nsamples * delta_r / 2), floor(nsamples * delta_r / 2), N_fft, Q, c);
         Q_hat(x, y) = ComplexExpr(c, Q_real(x, y), Q_imag(x, y));
 #if DEBUG_Q_HAT
         out_q_hat(c, x, y) = Q_hat.inner(c, x, y);
@@ -236,11 +258,14 @@ public:
             fftsh.inner.compute_root();
             dft.inner.compute_root();
             Q.inner.compute_root();
+            dr.compute_root();
             norm_r0.compute_root();
             rr0.compute_root();
             norm_rr0.compute_root();
             dr_i.compute_root();
+            Q_r.compute_root();
             Q_real.compute_root();
+            Q_i.compute_root();
             Q_imag.compute_root();
             Q_hat.inner.compute_root();
             img.inner.compute_root();
@@ -258,12 +283,15 @@ public:
             // cannot vectorize extern func from here, but func's impl can
             dft.inner.compute_root();
             Q.inner.compute_root().vectorize(x, vectorsize);
+            dr.compute_root().vectorize(x, vectorsize);
             norm_r0.compute_root().vectorize(x, vectorsize);
             rr0.compute_root().vectorize(x, vectorsize);
             norm_rr0.compute_root().vectorize(x, vectorsize);
             dr_i.compute_root().vectorize(x, vectorsize);
-            Q_real.compute_root().vectorize(x, vectorsize);
-            Q_imag.compute_root().vectorize(x, vectorsize);
+            Q_r.compute_root().vectorize(x, vectorsize);
+            Q_real.compute_root(); // cannot vectorize extern
+            Q_i.compute_root().vectorize(x, vectorsize);
+            Q_imag.compute_root(); // cannot vectorize extern
             Q_hat.inner.compute_root().vectorize(x, vectorsize);
             img.inner.compute_root().vectorize(x, vectorsize);
             fimg.inner.compute_root().vectorize(x, vectorsize);
@@ -280,11 +308,14 @@ public:
             fftsh.inner.compute_root().parallel(y);
             dft.inner.compute_root().parallel(y);
             Q.inner.compute_root().parallel(y);
+            dr.compute_root().parallel(x);
             norm_r0.compute_root().parallel(x);
             rr0.compute_root().parallel(z);
             norm_rr0.compute_root().parallel(y);
             dr_i.compute_root().parallel(y);
+            Q_r.compute_root().parallel(y);
             Q_real.compute_root().parallel(y);
+            Q_i.compute_root().parallel(y);
             Q_imag.compute_root().parallel(y);
             Q_hat.inner.compute_root().parallel(y);
             img.inner.compute_root().parallel(x);
@@ -304,12 +335,15 @@ public:
             // cannot vectorize extern func from here, but func's impl can
             dft.inner.compute_root().parallel(y);
             Q.inner.compute_root().vectorize(x, vectorsize).parallel(y);
+            dr.compute_root().vectorize(x, vectorsize).parallel(x);
             norm_r0.compute_root().vectorize(x, vectorsize).parallel(x);
             rr0.compute_root().vectorize(x, vectorsize).parallel(z);
             norm_rr0.compute_root().vectorize(x, vectorsize).parallel(y);
             dr_i.compute_root().vectorize(x, vectorsize).parallel(y);
-            Q_real.compute_root().vectorize(x, vectorsize).parallel(y);
-            Q_imag.compute_root().vectorize(x, vectorsize).parallel(y);
+            Q_r.compute_root().vectorize(x, vectorsize).parallel(y);
+            Q_real.compute_root().parallel(y); // cannot vectorize extern
+            Q_i.compute_root().vectorize(x, vectorsize).parallel(y);
+            Q_imag.compute_root().parallel(y); // cannot vectorize extern
             Q_hat.inner.compute_root().vectorize(x, vectorsize).parallel(y);
             img.inner.compute_root().vectorize(x, vectorsize).parallel(x);
             img.inner.update(0).vectorize(x, vectorsize).parallel(x);
@@ -331,11 +365,14 @@ private:
     ComplexFunc fftsh{c, "fftshift"};
     ComplexFunc dft{c, "dft"};
     ComplexFunc Q{c, "Q"};
+    Func dr{"dr"};
     Func norm_r0{"norm_r0"};
     Func rr0{"rr0"};
     Func norm_rr0{"norm_rr0"};
     Func dr_i{"dr_i"};
+    Func Q_r{"Q_r"};
     Func Q_real{"Q_real"};
+    Func Q_i{"Q_i"};
     Func Q_imag{"Q_imag"};
     ComplexFunc Q_hat{c, "Q_hat"};
     ComplexFunc img{c, "img"};
